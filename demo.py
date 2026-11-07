@@ -42,15 +42,9 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 # State variables
 is_clicking = False
-is_dragging = False # Tracks if we are actively pulling a window
-drag_offset_x, drag_offset_y = 0, 0 # Tracks the teleport distance
 smoothening = 2  
 prev_x, prev_y = 0, 0
 curr_x, curr_y = 0, 0
-
-# Variables for the Drag Deadzone
-click_lock_x, click_lock_y = 0, 0
-DRAG_DEADZONE = 40  # How many pixels you have to move before a click becomes a drag
 
 while True:
     ret, frame = cap.read()
@@ -60,84 +54,63 @@ while True:
     # Flip frame horizontally so it acts like a mirror
     frame = cv2.flip(frame, 1)
     
+    # MediaPipe Tasks API requires a specific Image object with a timestamp
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
     frame_timestamp_ms = int(time.time() * 1000)
     
+    # Process the frame
     results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
     h, w, c = frame.shape
 
     if results.hand_landmarks:
         for hand_landmarks in results.hand_landmarks:
+            # Convert normalized landmarks to pixel coordinates
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
             
+            # Draw skeleton manually using OpenCV
             for p1, p2 in HAND_CONNECTIONS:
                 cv2.line(frame, pts[p1], pts[p2], (0, 255, 180), 2)
             for px, py in pts:
                 cv2.circle(frame, (px, py), 4, (0, 255, 150), cv2.FILLED)
             
             # -------------------------
-            # GET RAW TARGET (MIDDLE FINGER)
+            # MOUSE MOVEMENT (DRIVEN BY MIDDLE FINGER)
             # -------------------------
             middle_tip = hand_landmarks[12]
+            
             target_x = int(middle_tip.x * SCREEN_WIDTH)
             target_y = int(middle_tip.y * SCREEN_HEIGHT)
-
-            # -------------------------
-            # PINCH TO CLICK (INDEX + THUMB)
-            # -------------------------
-            ix, iy = pts[8]  
-            tx, ty = pts[4]  
-            distance = math.hypot(tx - ix, ty - iy)
-
-            # Stricter thresholds so it requires a firm pinch
-            PINCH_START = 22  # Lowered from 30
-            PINCH_DROP = 45   # Lowered from 55
-
-            if distance < PINCH_START:
-                if not is_clicking:
-                    mouse.press(Button.left)
-                    is_clicking = True
-                    is_dragging = False # Reset drag state on new click
-                    # Lock the cursor to the exact spot the click started
-                    click_lock_x, click_lock_y = target_x, target_y
-                cv2.circle(frame, (ix, iy), 15, (0, 255, 0), cv2.FILLED)
-            elif distance > PINCH_DROP:
-                if is_clicking:
-                    mouse.release(Button.left)
-                    is_clicking = False
-                    is_dragging = False # Reset drag state on release
-
-            # -------------------------
-            # APPLY DRAG DEADZONE & OFFSET
-            # -------------------------
-            if is_clicking:
-                if not is_dragging:
-                    # Calculate how far the hand has moved since the click started
-                    move_dist = math.hypot(target_x - click_lock_x, target_y - click_lock_y)
-                    
-                    # If we haven't moved far, keep the cursor completely frozen
-                    if move_dist < DRAG_DEADZONE:
-                        target_x, target_y = click_lock_x, click_lock_y
-                    else:
-                        is_dragging = True
-                        # Record the exact offset gap when breaking the deadzone
-                        drag_offset_x = target_x - click_lock_x
-                        drag_offset_y = target_y - click_lock_y
-                
-                if is_dragging:
-                    # Subtract the offset so the cursor doesn't snap to the new hand position
-                    target_x -= drag_offset_x
-                    target_y -= drag_offset_y
-
-            # -------------------------
-            # UPDATE MOUSE POSITION
-            # -------------------------
+            
             curr_x = prev_x + (target_x - prev_x) / smoothening
             curr_y = prev_y + (target_y - prev_y) / smoothening
             
             mouse.position = (curr_x, curr_y)
             prev_x, prev_y = curr_x, curr_y
+
+            # -------------------------
+            # STANDARD PINCH TO CLICK (INDEX + THUMB)
+            # -------------------------
+            ix, iy = pts[8]  # index tip pixels
+            tx, ty = pts[4]  # thumb tip pixels
+            
+            distance = math.hypot(tx - ix, ty - iy)
+
+            # 1. Engage threshold
+            PINCH_START = 30
+            # 2. Release threshold
+            PINCH_DROP = 55 
+
+            if distance < PINCH_START:
+                if not is_clicking:
+                    mouse.press(Button.left)
+                    is_clicking = True
+                # Visual feedback on the pinch point
+                cv2.circle(frame, (ix, iy), 15, (0, 255, 0), cv2.FILLED)
+            elif distance > PINCH_DROP:
+                if is_clicking:
+                    mouse.release(Button.left)
+                    is_clicking = False
 
     cv2.imshow("Hand Tracker Debug (Press 'q' to quit)", frame)
 
