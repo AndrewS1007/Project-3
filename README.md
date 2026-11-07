@@ -21,7 +21,7 @@ python demo.py
 
 *Output:* A 640x480 webcam window with a hand-tracking skeleton overlay. Press `q` to quit.
 
-## 3. Inputs & Gestures (The Contract)
+## 3. Inputs & Gestures
 
 * **Aim:** Keep your Middle Finger extended.
 
