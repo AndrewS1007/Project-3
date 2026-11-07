@@ -1,15 +1,32 @@
 import cv2
 import mediapipe as mp
-import pygame
-import sys
+import math
+import ctypes
+import time
+from pynput.mouse import Button, Controller
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+# 1. Initialize OS Mouse Controller
+mouse = Controller()
+
+# 2. Get Windows Screen Resolution Natively
+user32 = ctypes.windll.user32
+SCREEN_WIDTH, SCREEN_HEIGHT = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+# 3. Setup Modern MediaPipe Hand Landmarker
+base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.VIDEO,
+    num_hands=1,
+    min_hand_detection_confidence=0.7,
+    min_hand_presence_confidence=0.7,
+    min_tracking_confidence=0.7
 )
+landmarker = vision.HandLandmarker.create_from_options(options)
 
+# 4. Define Hand Connections for OpenCV Drawing
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),         # thumb
     (0, 5), (5, 6), (6, 7), (7, 8),         # index
@@ -18,82 +35,115 @@ HAND_CONNECTIONS = [
     (13, 17), (0, 17), (17, 18), (18, 19), (19, 20) # pinky
 ]
 
-pygame.init()
-WIDTH, HEIGHT = 1280, 720
-window = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("3D Hand Sensing Sandbox (Multi-Hand)")
-clock = pygame.time.Clock()
-
-# wsl / linux camera
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-
+# 5. Standard Windows Camera Setup
+cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-font_main = pygame.font.SysFont("Menlo", 22)
-font_large = pygame.font.SysFont("Menlo", 36, bold=True)
+# State variables
+is_clicking = False
+is_dragging = False # Tracks if we are actively pulling a window
+drag_offset_x, drag_offset_y = 0, 0 # Tracks the teleport distance
+smoothening = 2  
+prev_x, prev_y = 0, 0
+curr_x, curr_y = 0, 0
+
+# Variables for the Drag Deadzone
+click_lock_x, click_lock_y = 0, 0
+DRAG_DEADZONE = 40  # How many pixels you have to move before a click becomes a drag
 
 while True:
-    dt = clock.tick(30)
-    
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            cap.release()
-            pygame.quit()
-            sys.exit()
-
     ret, frame = cap.read()
-    window.fill((20, 24, 33))
+    if not ret:
+        break
 
-    if ret:
-        frame = cv2.flip(frame, 1)
+    # Flip frame horizontally so it acts like a mirror
+    frame = cv2.flip(frame, 1)
+    
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    frame_timestamp_ms = int(time.time() * 1000)
+    
+    results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+    h, w, c = frame.shape
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if results.hand_landmarks:
+        for hand_landmarks in results.hand_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+            
+            for p1, p2 in HAND_CONNECTIONS:
+                cv2.line(frame, pts[p1], pts[p2], (0, 255, 180), 2)
+            for px, py in pts:
+                cv2.circle(frame, (px, py), 4, (0, 255, 150), cv2.FILLED)
+            
+            # -------------------------
+            # GET RAW TARGET (MIDDLE FINGER)
+            # -------------------------
+            middle_tip = hand_landmarks[12]
+            target_x = int(middle_tip.x * SCREEN_WIDTH)
+            target_y = int(middle_tip.y * SCREEN_HEIGHT)
 
-        # process
-        results = hands.process(rgb_frame)
+            # -------------------------
+            # PINCH TO CLICK (INDEX + THUMB)
+            # -------------------------
+            ix, iy = pts[8]  
+            tx, ty = pts[4]  
+            distance = math.hypot(tx - ix, ty - iy)
 
-        if results.multi_hand_landmarks:
-            for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                landmarks = hand_landmarks.landmark
+            # Stricter thresholds so it requires a firm pinch
+            PINCH_START = 22  # Lowered from 30
+            PINCH_DROP = 45   # Lowered from 55
 
-                index_tip = landmarks[8]
+            if distance < PINCH_START:
+                if not is_clicking:
+                    mouse.press(Button.left)
+                    is_clicking = True
+                    is_dragging = False # Reset drag state on new click
+                    # Lock the cursor to the exact spot the click started
+                    click_lock_x, click_lock_y = target_x, target_y
+                cv2.circle(frame, (ix, iy), 15, (0, 255, 0), cv2.FILLED)
+            elif distance > PINCH_DROP:
+                if is_clicking:
+                    mouse.release(Button.left)
+                    is_clicking = False
+                    is_dragging = False # Reset drag state on release
 
-                # translate & render
-                pts = [(int(lm.x * WIDTH), int(lm.y * HEIGHT)) for lm in landmarks]
+            # -------------------------
+            # APPLY DRAG DEADZONE & OFFSET
+            # -------------------------
+            if is_clicking:
+                if not is_dragging:
+                    # Calculate how far the hand has moved since the click started
+                    move_dist = math.hypot(target_x - click_lock_x, target_y - click_lock_y)
+                    
+                    # If we haven't moved far, keep the cursor completely frozen
+                    if move_dist < DRAG_DEADZONE:
+                        target_x, target_y = click_lock_x, click_lock_y
+                    else:
+                        is_dragging = True
+                        # Record the exact offset gap when breaking the deadzone
+                        drag_offset_x = target_x - click_lock_x
+                        drag_offset_y = target_y - click_lock_y
                 
-                # static colors for the skeleton
-                bone_color = (0, 255, 180) 
-                for p1, p2 in HAND_CONNECTIONS:
-                    pygame.draw.line(window, bone_color, pts[p1], pts[p2], 4)
+                if is_dragging:
+                    # Subtract the offset so the cursor doesn't snap to the new hand position
+                    target_x -= drag_offset_x
+                    target_y -= drag_offset_y
 
-                for i, lm in enumerate(landmarks):
-                    px, py = pts[i]
-                    node_radius = max(4, int(14 - (lm.z * 60)))
-                    node_color = (0, 255, 150) 
+            # -------------------------
+            # UPDATE MOUSE POSITION
+            # -------------------------
+            curr_x = prev_x + (target_x - prev_x) / smoothening
+            curr_y = prev_y + (target_y - prev_y) / smoothening
+            
+            mouse.position = (curr_x, curr_y)
+            prev_x, prev_y = curr_x, curr_y
 
-                    pygame.draw.circle(window, node_color, (px, py), node_radius)
-                    pygame.draw.circle(window, (255, 255, 255), (px, py), 2)
+    cv2.imshow("Hand Tracker Debug (Press 'q' to quit)", frame)
 
-                y_offset = hand_idx * 200
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-                state_str = f"HAND {hand_idx + 1}: DETECTED"
-                state_color = (0, 255, 150)
-                
-                state_text = font_large.render(state_str, True, state_color)
-                window.blit(state_text, (30, 30 + y_offset))
-
-                hud_lines = [
-                    f"Index Tip (#8) -> X: {index_tip.x:.3f} | Y: {index_tip.y:.3f} | Z: {index_tip.z:.3f}"
-                ]
-
-                for idx, line in enumerate(hud_lines):
-                    txt_surface = font_main.render(line, True, (220, 220, 230))
-                    window.blit(txt_surface, (30, 80 + y_offset + (idx * 28)))
-
-    else:
-        no_hand_txt = font_large.render("NO HAND DETECTED - Hold hands up to camera", True, (255, 100, 100))
-        window.blit(no_hand_txt, (WIDTH // 2 - 400, HEIGHT // 2))
-
-    pygame.display.update()
+landmarker.close()
+cap.release()
+cv2.destroyAllWindows()
