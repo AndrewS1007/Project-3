@@ -43,6 +43,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 # State variables
 is_clicking = False
 is_double_clicking = False
+is_right_clicking = False
 is_dragging = False 
 drag_offset_x, drag_offset_y = 0, 0 
 
@@ -104,21 +105,33 @@ while True:
             PINCH_START = 22  
             PINCH_DROP = 45   
             
-            # Thumb Flick Thresholds (Looser so it triggers easily)
+            # Thumb Flick Thresholds (Double Click)
             FLICK_START = 35
             FLICK_DROP = 55
 
             # -------------------------
-            # FIST DETECTOR (2D Scroll Joystick)
+            # GESTURE BOOLEANS
             # -------------------------
+            # Fist: All four fingertips below their respective middle knuckles
             is_fist = (
                 pts[8][1] > pts[6][1] and 
                 pts[12][1] > pts[10][1] and 
                 pts[16][1] > pts[14][1] and 
                 pts[20][1] > pts[18][1]
             )
+            
+            # MEDIUM-SENSITIVITY PINKY DROP: 
+            # Calculates the exact halfway point between the top joint (19) and middle joint (18)
+            pinky_midpoint_y = (pts[19][1] + pts[18][1]) / 2.0
+            
+            # Triggers when the pinky tip (20) dips below this halfway point,
+            # while the middle finger remains UP.
+            is_pinky_drop = (pts[20][1] > pinky_midpoint_y) and (pts[12][1] < pts[10][1])
 
-            if is_fist and not is_clicking and not is_double_clicking:
+            # -------------------------
+            # FIST DETECTOR (2D Scroll Joystick)
+            # -------------------------
+            if is_fist and not is_clicking and not is_double_clicking and not is_right_clicking:
                 if not is_fist_scroll:
                     is_fist_scroll = True
                     scroll_anchor_x = wrist_x
@@ -151,7 +164,7 @@ while True:
             # -------------------------
             # LEFT CLICK & DRAG (Index + Thumb)
             # -------------------------
-            if dist_index < PINCH_START and not is_fist_scroll and not is_double_clicking:
+            if dist_index < PINCH_START and not is_fist_scroll and not is_double_clicking and not is_right_clicking:
                 if not is_clicking:
                     mouse.press(Button.left)
                     is_clicking = True
@@ -167,15 +180,24 @@ while True:
             # -------------------------
             # INSTANT DOUBLE CLICK (Thumb Flick to Index Base)
             # -------------------------
-            if dist_thumb_flick < FLICK_START and not is_fist_scroll and not is_clicking:
+            if dist_thumb_flick < FLICK_START and not is_fist_scroll and not is_clicking and not is_right_clicking:
                 if not is_double_clicking:
                     mouse.click(Button.left, 2)
                     is_double_clicking = True
-                
-                # Visual feedback draws on the base of the index finger
                 cv2.circle(frame, (ix_base, iy_base), 15, (255, 255, 0), cv2.FILLED) # Cyan
             elif dist_thumb_flick > FLICK_DROP:
                 is_double_clicking = False
+                
+            # -------------------------
+            # RIGHT CLICK (Pinky Drop)
+            # -------------------------
+            if is_pinky_drop and not is_fist_scroll and not is_clicking and not is_double_clicking:
+                if not is_right_clicking:
+                    mouse.click(Button.right)
+                    is_right_clicking = True
+                cv2.circle(frame, pts[20], 15, (255, 0, 255), cv2.FILLED)
+            elif not is_pinky_drop:
+                is_right_clicking = False
 
             # -------------------------
             # APPLY DRAG DEADZONE & OFFSET
@@ -212,6 +234,7 @@ while True:
             is_clicking = False
             is_dragging = False
         is_double_clicking = False
+        is_right_clicking = False
         is_fist_scroll = False
 
     cv2.imshow("Hand Tracker Debug (Press 'q' to quit)", frame)
