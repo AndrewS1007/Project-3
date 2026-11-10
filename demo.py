@@ -42,75 +42,160 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 # State variables
 is_clicking = False
+is_dragging = False 
+drag_offset_x, drag_offset_y = 0, 0 
+
+# Scroll Variables
+is_fist_scroll = False
+scroll_anchor_x = 0
+scroll_anchor_y = 0
+SCROLL_DEADZONE = 15  
+
 smoothening = 2  
 prev_x, prev_y = 0, 0
 curr_x, curr_y = 0, 0
+
+# Variables for the Drag Deadzone
+click_lock_x, click_lock_y = 0, 0
+DRAG_DEADZONE = 40  
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # Flip frame horizontally so it acts like a mirror
     frame = cv2.flip(frame, 1)
     
-    # MediaPipe Tasks API requires a specific Image object with a timestamp
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
     frame_timestamp_ms = int(time.time() * 1000)
     
-    # Process the frame
     results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
     h, w, c = frame.shape
 
     if results.hand_landmarks:
         for hand_landmarks in results.hand_landmarks:
-            # Convert normalized landmarks to pixel coordinates
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
             
-            # Draw skeleton manually using OpenCV
             for p1, p2 in HAND_CONNECTIONS:
                 cv2.line(frame, pts[p1], pts[p2], (0, 255, 180), 2)
             for px, py in pts:
                 cv2.circle(frame, (px, py), 4, (0, 255, 150), cv2.FILLED)
             
             # -------------------------
-            # MOUSE MOVEMENT (DRIVEN BY MIDDLE FINGER)
+            # GET RAW TARGET (MIDDLE FINGER)
             # -------------------------
             middle_tip = hand_landmarks[12]
-            
             target_x = int(middle_tip.x * SCREEN_WIDTH)
             target_y = int(middle_tip.y * SCREEN_HEIGHT)
-            
-            curr_x = prev_x + (target_x - prev_x) / smoothening
-            curr_y = prev_y + (target_y - prev_y) / smoothening
-            
-            mouse.position = (curr_x, curr_y)
-            prev_x, prev_y = curr_x, curr_y
+
+            # Finger Coordinates
+            tx, ty = pts[4]   # Thumb tip
+            ix, iy = pts[8]   # Index tip
+            wrist_x, wrist_y = pts[0] # Wrist
+
+            dist_index = math.hypot(tx - ix, ty - iy)
+
+            PINCH_START = 22  
+            PINCH_DROP = 45   
 
             # -------------------------
-            # STANDARD PINCH TO CLICK (INDEX + THUMB)
+            # FIST DETECTOR (2D Scroll Joystick)
             # -------------------------
-            ix, iy = pts[8]  # index tip pixels
-            tx, ty = pts[4]  # thumb tip pixels
-            
-            distance = math.hypot(tx - ix, ty - iy)
+            is_fist = (
+                pts[8][1] > pts[6][1] and 
+                pts[12][1] > pts[10][1] and 
+                pts[16][1] > pts[14][1] and 
+                pts[20][1] > pts[18][1]
+            )
 
-            # 1. Engage threshold
-            PINCH_START = 30
-            # 2. Release threshold
-            PINCH_DROP = 55 
+            if is_fist and not is_clicking:
+                if not is_fist_scroll:
+                    is_fist_scroll = True
+                    scroll_anchor_x = wrist_x
+                    scroll_anchor_y = wrist_y 
+                else:
+                    delta_x = wrist_x - scroll_anchor_x
+                    delta_y = wrist_y - scroll_anchor_y
+                    
+                    h_scroll = 0
+                    v_scroll = 0
+                    
+                    # Horizontal scrolling calculation
+                    if abs(delta_x) > SCROLL_DEADZONE:
+                        speed_x = (abs(delta_x) - SCROLL_DEADZONE) / 40.0
+                        # Moving hand right (positive delta) scrolls right (positive scroll value)
+                        dir_x = 1 if delta_x > 0 else -1 
+                        h_scroll = dir_x * speed_x
+                        
+                    # Vertical scrolling calculation
+                    if abs(delta_y) > SCROLL_DEADZONE:
+                        speed_y = (abs(delta_y) - SCROLL_DEADZONE) / 40.0
+                        # Moving hand down (positive delta) scrolls down (negative scroll value)
+                        dir_y = -1 if delta_y > 0 else 1 
+                        v_scroll = dir_y * speed_y
+                        
+                    # Apply scroll ticks simultaneously if movement breaks either deadzone
+                    if h_scroll != 0 or v_scroll != 0:
+                        mouse.scroll(h_scroll, v_scroll)
+                        
+                    # Draw a 2D red "throttle line" indicating the omnidirectional joystick pull
+                    cv2.circle(frame, (scroll_anchor_x, scroll_anchor_y), 8, (0, 0, 255), cv2.FILLED)
+                    cv2.line(frame, (scroll_anchor_x, scroll_anchor_y), (wrist_x, wrist_y), (0, 0, 255), 4)
+            else:
+                is_fist_scroll = False
 
-            if distance < PINCH_START:
+            # -------------------------
+            # LEFT CLICK & DRAG (Index + Thumb)
+            # -------------------------
+            if dist_index < PINCH_START and not is_fist_scroll:
                 if not is_clicking:
                     mouse.press(Button.left)
                     is_clicking = True
-                # Visual feedback on the pinch point
+                    is_dragging = False 
+                    click_lock_x, click_lock_y = target_x, target_y
                 cv2.circle(frame, (ix, iy), 15, (0, 255, 0), cv2.FILLED)
-            elif distance > PINCH_DROP:
+            elif dist_index > PINCH_DROP:
                 if is_clicking:
                     mouse.release(Button.left)
                     is_clicking = False
+                    is_dragging = False 
+
+            # -------------------------
+            # APPLY DRAG DEADZONE & OFFSET
+            # -------------------------
+            if is_clicking:
+                if not is_dragging:
+                    move_dist = math.hypot(target_x - click_lock_x, target_y - click_lock_y)
+                    
+                    if move_dist < DRAG_DEADZONE:
+                        target_x, target_y = click_lock_x, click_lock_y
+                    else:
+                        is_dragging = True
+                        drag_offset_x = target_x - click_lock_x
+                        drag_offset_y = target_y - click_lock_y
+                
+                if is_dragging:
+                    target_x -= drag_offset_x
+                    target_y -= drag_offset_y
+
+            # -------------------------
+            # UPDATE MOUSE POSITION
+            # -------------------------
+            if not is_fist_scroll:
+                curr_x = prev_x + (target_x - prev_x) / smoothening
+                curr_y = prev_y + (target_y - prev_y) / smoothening
+                
+                mouse.position = (curr_x, curr_y)
+                prev_x, prev_y = curr_x, curr_y
+
+    else:
+        # SAFETY FALLBACK
+        if is_clicking:
+            mouse.release(Button.left)
+            is_clicking = False
+            is_dragging = False
+        is_fist_scroll = False
 
     cv2.imshow("Hand Tracker Debug (Press 'q' to quit)", frame)
 
