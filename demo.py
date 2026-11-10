@@ -42,6 +42,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 # State variables
 is_clicking = False
+is_double_clicking = False
 is_dragging = False 
 drag_offset_x, drag_offset_y = 0, 0 
 
@@ -90,14 +91,22 @@ while True:
             target_y = int(middle_tip.y * SCREEN_HEIGHT)
 
             # Finger Coordinates
-            tx, ty = pts[4]   # Thumb tip
-            ix, iy = pts[8]   # Index tip
+            tx, ty = pts[4]           # Thumb tip
+            ix, iy = pts[8]           # Index tip
+            ix_base, iy_base = pts[5] # Base knuckle of the Index finger
             wrist_x, wrist_y = pts[0] # Wrist
 
+            # Distances
             dist_index = math.hypot(tx - ix, ty - iy)
+            dist_thumb_flick = math.hypot(tx - ix_base, ty - iy_base)
 
+            # Standard Pinch Thresholds (Index + Thumb)
             PINCH_START = 22  
             PINCH_DROP = 45   
+            
+            # Thumb Flick Thresholds (Looser so it triggers easily)
+            FLICK_START = 35
+            FLICK_DROP = 55
 
             # -------------------------
             # FIST DETECTOR (2D Scroll Joystick)
@@ -109,7 +118,7 @@ while True:
                 pts[20][1] > pts[18][1]
             )
 
-            if is_fist and not is_clicking:
+            if is_fist and not is_clicking and not is_double_clicking:
                 if not is_fist_scroll:
                     is_fist_scroll = True
                     scroll_anchor_x = wrist_x
@@ -121,25 +130,19 @@ while True:
                     h_scroll = 0
                     v_scroll = 0
                     
-                    # Horizontal scrolling calculation
                     if abs(delta_x) > SCROLL_DEADZONE:
                         speed_x = (abs(delta_x) - SCROLL_DEADZONE) / 40.0
-                        # Moving hand right (positive delta) scrolls right (positive scroll value)
                         dir_x = 1 if delta_x > 0 else -1 
                         h_scroll = dir_x * speed_x
                         
-                    # Vertical scrolling calculation
                     if abs(delta_y) > SCROLL_DEADZONE:
                         speed_y = (abs(delta_y) - SCROLL_DEADZONE) / 40.0
-                        # Moving hand down (positive delta) scrolls down (negative scroll value)
                         dir_y = -1 if delta_y > 0 else 1 
                         v_scroll = dir_y * speed_y
                         
-                    # Apply scroll ticks simultaneously if movement breaks either deadzone
                     if h_scroll != 0 or v_scroll != 0:
                         mouse.scroll(h_scroll, v_scroll)
                         
-                    # Draw a 2D red "throttle line" indicating the omnidirectional joystick pull
                     cv2.circle(frame, (scroll_anchor_x, scroll_anchor_y), 8, (0, 0, 255), cv2.FILLED)
                     cv2.line(frame, (scroll_anchor_x, scroll_anchor_y), (wrist_x, wrist_y), (0, 0, 255), 4)
             else:
@@ -148,7 +151,7 @@ while True:
             # -------------------------
             # LEFT CLICK & DRAG (Index + Thumb)
             # -------------------------
-            if dist_index < PINCH_START and not is_fist_scroll:
+            if dist_index < PINCH_START and not is_fist_scroll and not is_double_clicking:
                 if not is_clicking:
                     mouse.press(Button.left)
                     is_clicking = True
@@ -160,6 +163,19 @@ while True:
                     mouse.release(Button.left)
                     is_clicking = False
                     is_dragging = False 
+
+            # -------------------------
+            # INSTANT DOUBLE CLICK (Thumb Flick to Index Base)
+            # -------------------------
+            if dist_thumb_flick < FLICK_START and not is_fist_scroll and not is_clicking:
+                if not is_double_clicking:
+                    mouse.click(Button.left, 2)
+                    is_double_clicking = True
+                
+                # Visual feedback draws on the base of the index finger
+                cv2.circle(frame, (ix_base, iy_base), 15, (255, 255, 0), cv2.FILLED) # Cyan
+            elif dist_thumb_flick > FLICK_DROP:
+                is_double_clicking = False
 
             # -------------------------
             # APPLY DRAG DEADZONE & OFFSET
@@ -195,6 +211,7 @@ while True:
             mouse.release(Button.left)
             is_clicking = False
             is_dragging = False
+        is_double_clicking = False
         is_fist_scroll = False
 
     cv2.imshow("Hand Tracker Debug (Press 'q' to quit)", frame)
