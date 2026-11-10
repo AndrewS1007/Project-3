@@ -94,20 +94,23 @@ while True:
             # Finger Coordinates
             tx, ty = pts[4]           # Thumb tip
             ix, iy = pts[8]           # Index tip
-            ix_base, iy_base = pts[5] # Base knuckle of the Index finger
+            ix_pip, iy_pip = pts[6]   # Index middle joint (PIP)
+            ix_mcp, iy_mcp = pts[5]   # Index base knuckle (MCP)
             wrist_x, wrist_y = pts[0] # Wrist
 
             # Distances
-            dist_index = math.hypot(tx - ix, ty - iy)
-            dist_thumb_flick = math.hypot(tx - ix_base, ty - iy_base)
+            dist_index = math.hypot(tx - ix, ty - iy)             # Left Click Pinch
+            dist_thumb_pip = math.hypot(tx - ix_pip, ty - iy_pip) # Double Click Tap (Upper)
+            dist_thumb_mcp = math.hypot(tx - ix_mcp, ty - iy_mcp) # Double Click Tap (Lower)
 
-            # Standard Pinch Thresholds (Index + Thumb)
-            PINCH_START = 22  
-            PINCH_DROP = 45   
-            
-            # Thumb Flick Thresholds (Double Click)
-            FLICK_START = 35
-            FLICK_DROP = 55
+            # HIGHER SENSITIVITY: Standard Pinch Thresholds (Left Click)
+            # Increased from 22/45 to 35/55 so the click registers lightly
+            PINCH_START = 35  
+            PINCH_DROP = 55   
+
+            # Side Tap Thresholds (Double Click)
+            SIDE_TAP_START = 40
+            SIDE_TAP_DROP = 60
 
             # -------------------------
             # GESTURE BOOLEANS
@@ -120,13 +123,13 @@ while True:
                 pts[20][1] > pts[18][1]
             )
             
-            # MEDIUM-SENSITIVITY PINKY DROP: 
-            # Calculates the exact halfway point between the top joint (19) and middle joint (18)
+            # Pinky Drop (Right Click): Pinky tip below midpoint, middle finger UP
             pinky_midpoint_y = (pts[19][1] + pts[18][1]) / 2.0
-            
-            # Triggers when the pinky tip (20) dips below this halfway point,
-            # while the middle finger remains UP.
             is_pinky_drop = (pts[20][1] > pinky_midpoint_y) and (pts[12][1] < pts[10][1])
+
+            # Extended Double Click Hitbox: True if thumb hits EITHER the upper or lower joint
+            is_tapping_side = (dist_thumb_pip < SIDE_TAP_START) or (dist_thumb_mcp < SIDE_TAP_START)
+            is_releasing_side = (dist_thumb_pip > SIDE_TAP_DROP) and (dist_thumb_mcp > SIDE_TAP_DROP)
 
             # -------------------------
             # FIST DETECTOR (2D Scroll Joystick)
@@ -162,9 +165,9 @@ while True:
                 is_fist_scroll = False
 
             # -------------------------
-            # LEFT CLICK & DRAG (Index + Thumb)
+            # LEFT CLICK & DRAG (Index Tip + Thumb Tip)
             # -------------------------
-            if dist_index < PINCH_START and not is_fist_scroll and not is_double_clicking and not is_right_clicking:
+            if dist_index < PINCH_START and is_releasing_side and not is_fist_scroll and not is_double_clicking and not is_right_clicking:
                 if not is_clicking:
                     mouse.press(Button.left)
                     is_clicking = True
@@ -178,14 +181,24 @@ while True:
                     is_dragging = False 
 
             # -------------------------
-            # INSTANT DOUBLE CLICK (Thumb Flick to Index Base)
+            # INSTANT DOUBLE CLICK (Extended Side Tap)
             # -------------------------
-            if dist_thumb_flick < FLICK_START and not is_fist_scroll and not is_clicking and not is_right_clicking:
+            # Increased distance requirement (dist_index > 55) to match the new PINCH_DROP threshold
+            if is_tapping_side and dist_index > 55 and not is_fist_scroll and not is_clicking and not is_right_clicking:
                 if not is_double_clicking:
-                    mouse.click(Button.left, 2)
+                    # Manually execute the double click with a 50ms hardware-realistic delay
+                    mouse.press(Button.left)
+                    mouse.release(Button.left)
+                    time.sleep(0.05)
+                    mouse.press(Button.left)
+                    mouse.release(Button.left)
+                    
                     is_double_clicking = True
-                cv2.circle(frame, (ix_base, iy_base), 15, (255, 255, 0), cv2.FILLED) # Cyan
-            elif dist_thumb_flick > FLICK_DROP:
+                
+                cv2.circle(frame, pts[6], 15, (255, 255, 0), cv2.FILLED) 
+                cv2.circle(frame, pts[5], 15, (255, 255, 0), cv2.FILLED)
+                cv2.line(frame, pts[6], pts[5], (255, 255, 0), 10)
+            elif is_releasing_side:
                 is_double_clicking = False
                 
             # -------------------------
