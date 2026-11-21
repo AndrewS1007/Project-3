@@ -16,6 +16,75 @@ HAND_CONNECTIONS = [
 ]
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("hCursor", ctypes.c_void_p),
+        ("ptScreenPos", _POINT),
+    ]
+
+
+class _CursorTargetDetector:
+    """Lightweight Win32 GetCursorInfo reader to detect resize bars, links, and custom handles."""
+    CURSOR_SHOWING = 0x00000001
+    IDC_ARROW = 32512
+    IDC_IBEAM = 32513
+    IDC_WAIT = 32514
+    IDC_NO = 32648
+    IDC_HAND = 32649
+    IDC_APPSTARTING = 32650
+
+    def __init__(self):
+        self.user32 = ctypes.windll.user32
+        self.user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.user32.LoadCursorW.restype = ctypes.c_void_p
+        self.user32.GetCursorInfo.argtypes = [ctypes.POINTER(_CURSORINFO)]
+        self.user32.GetCursorInfo.restype = ctypes.c_int
+
+        # Plain cursors where we want normal unconstrained movement (no sticky friction)
+        plain_ids = (
+            self.IDC_ARROW,
+            self.IDC_IBEAM,
+            self.IDC_WAIT,
+            self.IDC_NO,
+            self.IDC_APPSTARTING,
+        )
+        self.plain_handles = {
+            h for cid in plain_ids if (h := self.user32.LoadCursorW(None, cid))
+        }
+        self.hand_handle = self.user32.LoadCursorW(None, self.IDC_HAND)
+
+    def get_cursor_state(self, fallback_x, fallback_y):
+        """
+        Returns (target_type, screen_x, screen_y) where target_type is:
+          - 'plain'  : standard arrow, text I-beam, busy/disabled, or hidden
+          - 'hand'   : clickable link / pointer hand
+          - 'resize' : standard OS resize arrows or custom app/VS Code sash handles
+        """
+        try:
+            ci = _CURSORINFO()
+            ci.cbSize = ctypes.sizeof(_CURSORINFO)
+            if not self.user32.GetCursorInfo(ctypes.byref(ci)):
+                return "plain", int(fallback_x), int(fallback_y)
+
+            x, y = int(ci.ptScreenPos.x), int(ci.ptScreenPos.y)
+            if not (ci.flags & self.CURSOR_SHOWING) or not ci.hCursor:
+                return "plain", x, y
+
+            if ci.hCursor in self.plain_handles:
+                return "plain", x, y
+            if self.hand_handle and ci.hCursor == self.hand_handle:
+                return "hand", x, y
+            return "resize", x, y
+        except Exception:
+            return "plain", int(fallback_x), int(fallback_y)
+
+
 def get_hand_center(pts):
     """Whole-hand centroid (base knuckles + main fingertips) to capture arm or wrist swats."""
     indices = (5, 9, 13, 17, 8, 12, 16)
@@ -70,12 +139,26 @@ class HandMouse:
     HAND_SWITCH_COOLDOWN = 0.16    # Micro-debounce (~4-5 frames) to prevent single-swat bounce
     SWITCH_FLASH_DURATION = 0.40   # Snappy cursor flash for rapid switches
 
-    # Gesture & Movement Tuning
+    # Adaptive Smoothing (velocity-based: steady on tiny targets, snappy on sweeps)
+    SMOOTH_SLOW = 5.0              # Heavy stabilization during slow micro-adjustments
+    SMOOTH_FAST = 1.6              # Crisp response during fast sweeps across the monitor
+    ADAPTIVE_SLOW_PX = 4.0         # Pixel delta at or below which full slow smoothing applies
+    ADAPTIVE_FAST_PX = 45.0        # Pixel delta at or above which full fast smoothing applies
+    JITTER_DEADZONE = 1.5          # Ignores sub-1.5px landmark tremor when holding hand still
+
+    # Precision Target Sticky Friction & Overshoot Snap-Back
+    STICKY_SMOOTHENING = 8.5       # "Speed bump" damping when crossing resize bars or links
+    STICKY_BREAKOUT_PX = 60.0      # Deliberate fast sweep breaks off sticky friction immediately
+    SNAP_MEMORY_SEC = 0.40         # How long (sec) a recently crossed slim target stays snappable
+    SNAP_RADIUS_PX = 28.0          # Max overshoot distance (px) rescued on left-click
+    SNAP_SETTLE_SEC = 0.012        # Brief pause so apps like VS Code register hover before press
+
+    # Gesture & Drag Tuning
     ROCK_ON_HOLD_TIME = 0.25
     FLASH_DURATION = 0.35
     SCROLL_DEADZONE = 15
-    SMOOTHENING = 2
     DRAG_DEADZONE = 40
+    RESIZE_DRAG_DEADZONE = 14      # Tighter deadzone when grabbing resize bars for instant drag
 
     # Thumb-Across-Palm Thresholds (0.0 = index base, 1.0 = pinky base)
     THUMB_CLICK_START = 0.12
@@ -83,6 +166,7 @@ class HandMouse:
 
     def __init__(self, default_hand="Right"):
         self.mouse = Controller()
+        self.cursor_detector = _CursorTargetDetector()
 
         # Native Windows Screen Resolution
         user32 = ctypes.windll.user32
@@ -114,8 +198,8 @@ class HandMouse:
         self.is_double_clicking = False
         self.is_right_clicking = False
         self.is_dragging = False
-        self.drag_offset_x = 0
-        self.drag_offset_y = 0
+        self.drag_offset_x = 0.0
+        self.drag_offset_y = 0.0
 
         # Brief persistence timer for instant clicks
         self.flash_state = None
@@ -126,11 +210,19 @@ class HandMouse:
         self.scroll_anchor_x = 0
         self.scroll_anchor_y = 0
 
-        # Cursor Smoothing & Drag Deadzone
+        # Cursor Smoothing, Drag Anchor & Snap-Back Memory
         self.prev_x, self.prev_y = self.mouse.position
         self.curr_x, self.curr_y = self.prev_x, self.prev_y
-        self.click_lock_x = 0
-        self.click_lock_y = 0
+        self.click_lock_x = 0.0
+        self.click_lock_y = 0.0
+        self.click_cursor_x = 0.0
+        self.click_cursor_y = 0.0
+        self.active_drag_deadzone = self.DRAG_DEADZONE
+
+        self.last_target_pos = None
+        self.last_target_type = "plain"
+        self.last_target_time = 0.0
+        self.snap_debug_until = 0.0
 
     def reset_gesture_states(self):
         if self.is_clicking:
@@ -142,6 +234,8 @@ class HandMouse:
         self.is_fist_scroll = False
         self.rock_on_start_time = None
         self.rock_on_triggered = False
+        self.last_target_pos = None
+        self.last_target_type = "plain"
 
     def cleanup(self):
         """Safely release any held mouse buttons on program exit."""
@@ -241,6 +335,29 @@ class HandMouse:
         alignment = proj_flow / max(flow_mag, 1e-6)
 
         return proj_flow >= self.FLOW_SWAT_SPEED and alignment >= self.FLOW_ALIGNMENT_MIN
+
+    def _try_snap_back(self, cursor_type, os_x, os_y, now):
+        """
+        If the user clicked just after overshooting a thin resize bar or link,
+        snap the cursor back onto that saved target before pressing Button.left.
+        Returns the effective target type ('plain', 'hand', or 'resize').
+        """
+        if cursor_type != "plain":
+            return cursor_type
+
+        if self.last_target_pos is None or (now - self.last_target_time) > self.SNAP_MEMORY_SEC:
+            return "plain"
+
+        sx, sy = self.last_target_pos
+        if math.hypot(os_x - sx, os_y - sy) <= self.SNAP_RADIUS_PX:
+            self.mouse.position = (sx, sy)
+            self.curr_x, self.curr_y = float(sx), float(sy)
+            self.prev_x, self.prev_y = float(sx), float(sy)
+            self.snap_debug_until = now + 0.35
+            time.sleep(self.SNAP_SETTLE_SEC)
+            return self.last_target_type
+
+        return "plain"
 
     def update(self, frame, detected_hands, now):
         """
@@ -401,9 +518,11 @@ class HandMouse:
                         self.is_fist_scroll = False
                         self.flash_state = None
                         self.flash_until = 0.0
+                        self.last_target_pos = None
 
                         if self.is_mouse_active:
                             self.prev_x, self.prev_y = self.mouse.position
+                            self.curr_x, self.curr_y = self.prev_x, self.prev_y
                 else:
                     self.rock_on_start_time = None
                     self.rock_on_triggered = False
@@ -432,8 +551,26 @@ class HandMouse:
         norm_x = max(0.0, min(1.0, norm_x))
         norm_y = max(0.0, min(1.0, norm_y))
 
-        target_x = int(norm_x * (self.screen_width - 1))
-        target_y = int(norm_y * (self.screen_height - 1))
+        target_x = norm_x * (self.screen_width - 1)
+        target_y = norm_y * (self.screen_height - 1)
+
+        # -------------------------
+        # QUERY WINDOWS CURSOR SHAPE (STICKY TARGET & SNAP MEMORY)
+        # -------------------------
+        cursor_type, os_x, os_y = self.cursor_detector.get_cursor_state(self.curr_x, self.curr_y)
+        if not self.is_clicking and cursor_type != "plain":
+            self.last_target_pos = (os_x, os_y)
+            self.last_target_type = cursor_type
+            self.last_target_time = now
+            cv2.putText(
+                frame, f"MAGNET: {cursor_type.upper()}", (12, 54),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 220, 0), 2
+            )
+        elif now < self.snap_debug_until:
+            cv2.putText(
+                frame, "SNAPPED TO TARGET", (12, 54),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 180), 2
+            )
 
         # Key Coordinates
         tx, ty = pts[4]            # Thumb tip
@@ -501,7 +638,7 @@ class HandMouse:
             self.is_fist_scroll = False
 
         # -------------------------
-        # LEFT CLICK & DRAG (Thumb Across Palm)
+        # LEFT CLICK & DRAG (Thumb Across Palm + Overshoot Snap-Back)
         # -------------------------
         if (
             palm_facing_camera
@@ -511,10 +648,15 @@ class HandMouse:
             and not self.is_right_clicking
         ):
             if not self.is_clicking and middle_up:
+                effective_type = self._try_snap_back(cursor_type, os_x, os_y, now)
                 self.mouse.press(Button.left)
                 self.is_clicking = True
                 self.is_dragging = False
                 self.click_lock_x, self.click_lock_y = target_x, target_y
+                self.click_cursor_x, self.click_cursor_y = self.curr_x, self.curr_y
+                self.active_drag_deadzone = (
+                    self.RESIZE_DRAG_DEADZONE if effective_type == "resize" else self.DRAG_DEADZONE
+                )
             if self.is_clicking:
                 cv2.circle(frame, (tx, ty), 15, (0, 255, 0), cv2.FILLED)
         elif thumb_palm_ratio < self.THUMB_CLICK_DROP or not palm_facing_camera:
@@ -568,29 +710,53 @@ class HandMouse:
             self.is_right_clicking = False
 
         # -------------------------
-        # APPLY DRAG DEADZONE & OFFSET
+        # APPLY DRAG DEADZONE & OFFSET (ANCHORED TO SNAPPED CURSOR)
         # -------------------------
         if self.is_clicking:
             if not self.is_dragging:
                 move_dist = math.hypot(target_x - self.click_lock_x, target_y - self.click_lock_y)
 
-                if move_dist < self.DRAG_DEADZONE:
-                    target_x, target_y = self.click_lock_x, self.click_lock_y
+                if move_dist < self.active_drag_deadzone:
+                    target_x, target_y = self.click_cursor_x, self.click_cursor_y
                 else:
                     self.is_dragging = True
-                    self.drag_offset_x = target_x - self.click_lock_x
-                    self.drag_offset_y = target_y - self.click_lock_y
+                    self.drag_offset_x = target_x - self.click_cursor_x
+                    self.drag_offset_y = target_y - self.click_cursor_y
 
             if self.is_dragging:
                 target_x -= self.drag_offset_x
                 target_y -= self.drag_offset_y
 
         # -------------------------
-        # UPDATE MOUSE POSITION
+        # UPDATE MOUSE POSITION (ADAPTIVE SMOOTHING + STICKY FRICTION)
         # -------------------------
         if not self.is_fist_scroll and not is_rock_on:
-            self.curr_x = self.prev_x + (target_x - self.prev_x) / self.SMOOTHENING
-            self.curr_y = self.prev_y + (target_y - self.prev_y) / self.SMOOTHENING
+            if self.is_clicking and not self.is_dragging:
+                # Hold completely locked on the clicked/snapped pixel until drag deadzone breaks
+                self.curr_x, self.curr_y = self.click_cursor_x, self.click_cursor_y
+                self.prev_x, self.prev_y = self.curr_x, self.curr_y
+                return
+
+            dx = target_x - self.prev_x
+            dy = target_y - self.prev_y
+            move_dist = math.hypot(dx, dy)
+
+            if not self.is_dragging and move_dist < self.JITTER_DEADZONE:
+                return
+
+            # Velocity-based adaptive smoothing
+            speed_t = max(
+                0.0,
+                min(1.0, (move_dist - self.ADAPTIVE_SLOW_PX) / max(self.ADAPTIVE_FAST_PX - self.ADAPTIVE_SLOW_PX, 1.0))
+            )
+            smooth = self.SMOOTH_SLOW + (self.SMOOTH_FAST - self.SMOOTH_SLOW) * speed_t
+
+            # Sticky friction "speed bump" when hovering over slim resize bars or links
+            if not self.is_clicking and cursor_type != "plain" and move_dist < self.STICKY_BREAKOUT_PX:
+                smooth = max(smooth, self.STICKY_SMOOTHENING)
+
+            self.curr_x = self.prev_x + dx / smooth
+            self.curr_y = self.prev_y + dy / smooth
 
             self.mouse.position = (self.curr_x, self.curr_y)
             self.prev_x, self.prev_y = self.curr_x, self.curr_y
