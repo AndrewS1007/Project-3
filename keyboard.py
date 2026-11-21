@@ -50,6 +50,10 @@ STARTER_WORDS = (
 ).split()
 
 
+_N_SAMPLES = 24
+_UNIT_T = np.linspace(0.0, 1.0, _N_SAMPLES, dtype=np.float32)
+
+
 def _path_length(points):
     arr = np.asarray(points, dtype=np.float32)
     if len(arr) < 2:
@@ -58,7 +62,7 @@ def _path_length(points):
     return float(np.sum(np.hypot(diffs[:, 0], diffs[:, 1])))
 
 
-def _resample_path(points, n_samples=24):
+def _resample_path(points, n_samples=_N_SAMPLES):
     """Resamples a 2D polyline to `n_samples` evenly spaced points along arc length."""
     arr = np.asarray(points, dtype=np.float32)
     if len(arr) == 0:
@@ -72,8 +76,12 @@ def _resample_path(points, n_samples=24):
     if total_len < 1e-6:
         return np.repeat(arr[:1], n_samples, axis=0)
 
-    cum_dist = np.concatenate(([0.0], np.cumsum(seg_lens)))
-    target_dists = np.linspace(0.0, total_len, n_samples)
+    cum_dist = np.empty(len(arr), dtype=np.float32)
+    cum_dist[0] = 0.0
+    np.cumsum(seg_lens, out=cum_dist[1:])
+
+    t_grid = _UNIT_T if n_samples == _N_SAMPLES else np.linspace(0.0, 1.0, n_samples, dtype=np.float32)
+    target_dists = t_grid * total_len
     xs = np.interp(target_dists, cum_dist, arr[:, 0])
     ys = np.interp(target_dists, cum_dist, arr[:, 1])
     return np.column_stack((xs, ys)).astype(np.float32)
@@ -90,17 +98,17 @@ def _normalize_shape(resampled):
 
 class _SwipeDecoder:
     """
-    Offline geometric swipe-to-text decoder combining:
-      - Path location & normalized shape similarity
-      - Total path length matching
-      - Per-letter waypoint coverage (penalizes words containing letters the swipe never approached)
+    Offline geometric swipe-to-text decoder & fast frequency-ranked prefix autocomplete.
     """
-    N_SAMPLES = 24
+    N_SAMPLES = _N_SAMPLES
 
     def __init__(self, key_unit_centers, wordlist_path="wordlist.txt"):
         self.key_centers = key_unit_centers
         self.words = self._load_words(wordlist_path)
         self.index = {}
+        self.prefix_1 = {}
+        self.prefix_2 = {}
+        self.prefix_3 = {}
         self._build_templates()
 
     def _load_words(self, wordlist_path):
@@ -131,22 +139,65 @@ class _SwipeDecoder:
 
     def _build_templates(self):
         total = max(len(self.words), 1)
+        key_centers = self.key_centers
+
         for rank, word in enumerate(self.words):
+            # Prefix lookup buckets (words are already ordered by frequency)
+            p1 = word[0]
+            b1 = self.prefix_1.setdefault(p1, [])
+            if len(b1) < 5:
+                b1.append(word)
+
+            p2 = word[:2]
+            b2 = self.prefix_2.setdefault(p2, [])
+            if len(b2) < 5:
+                b2.append(word)
+
+            if len(word) >= 3:
+                self.prefix_3.setdefault(word[:3], []).append(word)
+
+            # Swipe path template
             dedup = [word[0]]
             for ch in word[1:]:
                 if ch != dedup[-1]:
                     dedup.append(ch)
 
-            pts = [self.key_centers[ch] for ch in dedup]
-            tpl_len = _path_length(pts)
+            pts = np.array([key_centers[ch] for ch in dedup], dtype=np.float32)
+            if len(pts) >= 2:
+                diffs = np.diff(pts, axis=0)
+                seg_lens = np.hypot(diffs[:, 0], diffs[:, 1])
+                tpl_len = float(np.sum(seg_lens))
+            else:
+                tpl_len = 0.0
+
             loc = _resample_path(pts, self.N_SAMPLES)
             shape = _normalize_shape(loc)
-            uniq_pts = np.asarray(pts, dtype=np.float32)
-            # Gentle frequency tie-breaker so common longer words don't overpower exact short matches
             rank_penalty = 0.08 * (rank / total)
             self.index.setdefault((word[0], word[-1]), []).append(
-                (word, loc, shape, tpl_len, uniq_pts, rank_penalty)
+                (word, loc, shape, tpl_len, pts, rank_penalty)
             )
+
+    def suggest_prefix(self, prefix, top_k=5):
+        """Returns up to `top_k` frequency-ranked words starting with `prefix`."""
+        p = prefix.lower()
+        if not p:
+            return []
+        if len(p) == 1:
+            return self.prefix_1.get(p, [])[:top_k]
+        if len(p) == 2:
+            return self.prefix_2.get(p, [])[:top_k]
+
+        bucket = self.prefix_3.get(p[:3], [])
+        if len(p) == 3:
+            return bucket[:top_k]
+
+        matches = []
+        for w in bucket:
+            if w.startswith(p):
+                matches.append(w)
+                if len(matches) >= top_k:
+                    break
+        return matches
 
     def _nearby_keys(self, ux, uy, radius=1.25, min_count=3):
         dists = sorted(
@@ -158,7 +209,7 @@ class _SwipeDecoder:
             picked.add(ch)
         return picked
 
-    def decode(self, unit_points, top_k=3):
+    def decode(self, unit_points, top_k=5):
         """Returns up to `top_k` best matching words for a swipe in key-unit coordinates."""
         if len(unit_points) < 2:
             return []
@@ -190,7 +241,6 @@ class _SwipeDecoder:
                     shape_err = float(np.mean(np.hypot(user_shape[:, 0] - tpl_shape[:, 0], user_shape[:, 1] - tpl_shape[:, 1])))
                     len_err = abs(user_len - tpl_len) / max(tpl_len, 1.0)
 
-                    # Waypoint coverage: how close the swipe came to every letter required by `word`
                     wp_dists = np.hypot(
                         uniq_pts[:, None, 0] - user_loc[None, :, 0],
                         uniq_pts[:, None, 1] - user_loc[None, :, 1],
@@ -222,7 +272,7 @@ class _SwipeDecoder:
 class HandKeyboard:
     """
     Focus-safe, click-through Smart Auto-Docking Slab keyboard with mobile
-    tap + hold-and-swipe typing (supports both thumb-sweep and closed-fist presses).
+    tap + hold-and-swipe typing and a 5-slot clickable word suggestion bar.
     """
 
     # Colors
@@ -234,15 +284,21 @@ class HandKeyboard:
     KEY_HOVER_BG = "#2D3B52"
     KEY_ACTIVE_BG = "#00B8D4"
     KEY_SHIFT_ON_BG = "#1E465A"
+    SUGG_BG = "#1D2432"
+    SUGG_ACTIVE_BG = "#173A4A"
+    SUGG_ACTIVE_OUTLINE = "#00E5FF"
+    SUGG_OUTLINE = "#2E3A4F"
     KEY_TEXT = "#F1F5F9"
     KEY_SUBTEXT = "#94A3B8"
     SWIPE_TRAIL_COLOR = "#00E5FF"
 
+    SUGGESTION_COUNT = 5
+
     # Interaction & Swipe Timing/Distance Tuning
-    SWIPE_START_PX = 36.0          # Deliberate distance before switching from tap to swipe
-    MIN_SWIPE_UNITS = 1.15         # Minimum key-unit travel required to decode as a swipe
-    SWIPE_RELEASE_GRACE_SEC = 0.12 # Grace period so 1-2 frame flickers don't cut off fast swipes
-    SWIPE_RELEASE_TRIM_SEC = 0.06  # Trims last 60ms of trail to remove fist-opening jerk
+    SWIPE_START_PX = 36.0
+    MIN_SWIPE_UNITS = 1.15
+    SWIPE_RELEASE_GRACE_SEC = 0.12
+    SWIPE_RELEASE_TRIM_SEC = 0.06
     SHIFT_DOUBLE_TAP_SEC = 0.40
     BKSP_REPEAT_DELAY = 0.45
     BKSP_REPEAT_INTERVAL = 0.085
@@ -270,10 +326,10 @@ class HandKeyboard:
         self.screen_w = self.root.winfo_screenwidth()
         self.screen_h = self.root.winfo_screenheight()
 
-        # Smart Auto-Docking Slab dimensions (~70% width, ~34% height)
+        # Smart Auto-Docking Slab dimensions (~70% width, ~35% height; 48px suggestion header)
         self.width = max(720, min(int(self.screen_w * 0.70), 1440))
-        self.height = max(250, min(int(self.screen_h * 0.34), 400))
-        self.header_h = 40
+        self.height = max(258, min(int(self.screen_h * 0.35), 408))
+        self.header_h = 48
         self.pad = 10
         self.key_gap = 6
 
@@ -283,12 +339,20 @@ class HandKeyboard:
         self.is_visible = False
         self.closed_at = 0.0
 
-        # Keyboard Mode State
+        # Keyboard & Word Suggestion State
         self.layer = "alpha"       # "alpha" or "symbol"
         self.shift_mode = "off"    # "off", "once", "caps"
         self.last_shift_tap = 0.0
-        self.last_swiped_len = 0
+
+        self.typed_buffer = ""             # Current prefix while tap-typing
+        self.last_swiped_word = ""         # Most recent swiped word (without leading space)
+        self.swipe_prefix_space = ""       # " " if auto-space was prepended, else ""
+        self.last_swiped_len = 0           # Total chars typed for Smart Backspace undo
         self.auto_space_pending = False
+
+        self.suggestion_mode = None        # None, "swipe", or "prefix"
+        self.suggestions = []              # Formatted strings shown in slots 0..4
+        self.active_suggestion_idx = None  # Highlighted slot index (for swipe replacement)
 
         # Pointer & Swipe State
         self.was_pressed = False
@@ -297,7 +361,7 @@ class HandKeyboard:
         self.press_pos = (0.0, 0.0)
         self.hovered_key = None
         self.is_swiping = False
-        self.swipe_points = []      # List of (timestamp, lx, ly)
+        self.swipe_points = []             # List of (timestamp, lx, ly)
         self.swipe_release_time = None
         self.swipe_trail_id = None
         self.bksp_next_repeat = 0.0
@@ -397,6 +461,10 @@ class HandKeyboard:
         self._reset_interaction()
         self.auto_space_pending = False
         self.last_swiped_len = 0
+        self.last_swiped_word = ""
+        self.swipe_prefix_space = ""
+        self.typed_buffer = ""
+        self._clear_suggestions()
         self.user32.ShowWindow(self.hwnd, 0)  # SW_HIDE
 
     def toggle(self, cursor_y=None):
@@ -429,7 +497,9 @@ class HandKeyboard:
         self.canvas.delete("all")
         self.keys.clear()
         self.key_map.clear()
+        self.hovered_key = None
 
+        # Outer frame & header background
         self.canvas.create_rectangle(
             1, 1, self.width - 2, self.height - 2,
             fill=self.BG_COLOR, outline=self.BORDER_COLOR, width=2
@@ -443,25 +513,45 @@ class HandKeyboard:
             fill=self.BORDER_COLOR, width=1
         )
 
-        self.status_item = self.canvas.create_text(
-            18, self.header_h // 2,
-            text=self.status_text,
-            fill=self.KEY_SUBTEXT,
-            anchor="w",
-            font=("Segoe UI", 9, "bold")
-        )
-
-        btn_h = self.header_h - 10
+        # Header Utility Buttons on right: [TOP/BOT] and [X]
+        btn_y1 = 6
+        btn_y2 = self.header_h - 6
         close_w = 46
         dock_w = 56
         close_x2 = self.width - 8
         close_x1 = close_x2 - close_w
-        dock_x2 = close_x1 - 8
+        dock_x2 = close_x1 - 6
         dock_x1 = dock_x2 - dock_w
 
-        self._add_key_rect("DOCK", "TOP" if self.dock == "bottom" else "BOT", dock_x1, 5, dock_x2, 5 + btn_h, is_special=True, font_size=8)
-        self._add_key_rect("CLOSE", "X", close_x1, 5, close_x2, 5 + btn_h, is_special=True, font_size=10)
+        self._add_key_rect("DOCK", "TOP" if self.dock == "bottom" else "BOT", dock_x1, btn_y1, dock_x2, btn_y2, is_special=True, font_size=8)
+        self._add_key_rect("CLOSE", "X", close_x1, btn_y1, close_x2, btn_y2, is_special=True, font_size=10)
 
+        # 5 Clickable Word Suggestion Pills across the remaining header width
+        sugg_left = 8
+        sugg_right = dock_x1 - 10
+        sugg_gap = 6
+        sugg_w = (sugg_right - sugg_left - sugg_gap * (self.SUGGESTION_COUNT - 1)) / self.SUGGESTION_COUNT
+
+        for i in range(self.SUGGESTION_COUNT):
+            sx1 = sugg_left + i * (sugg_w + sugg_gap)
+            sx2 = sx1 + sugg_w
+            self._add_key_rect(
+                f"SUGG_{i}", "", sx1, btn_y1, sx2, btn_y2,
+                is_special=False, font_size=10,
+                custom_bg=self.SUGG_BG, custom_outline=self.SUGG_OUTLINE,
+                enabled=False
+            )
+
+        # Idle/feedback hint (only visible when no word suggestions are active)
+        self.status_item = self.canvas.create_text(
+            (sugg_left + sugg_right) * 0.5, self.header_h // 2,
+            text=self.status_text,
+            fill=self.KEY_SUBTEXT,
+            anchor="center",
+            font=("Segoe UI", 9, "bold")
+        )
+
+        # Key Rows Area
         rows = self.ALPHA_ROWS if self.layer == "alpha" else self.SYMBOL_ROWS
         grid_top = self.header_h + self.pad
         grid_bottom = self.height - self.pad
@@ -507,17 +597,23 @@ class HandKeyboard:
                     self.alpha_unit_centers[key_id] = (ux, uy)
 
         self._refresh_shift_visuals()
+        self._refresh_suggestions_ui()
 
-    def _add_key_rect(self, key_id, label, x1, y1, x2, y2, is_special=False, font_size=12):
-        bg = self.KEY_SPEC_BG if is_special else self.KEY_BG
+    def _add_key_rect(
+        self, key_id, label, x1, y1, x2, y2,
+        is_special=False, font_size=12,
+        custom_bg=None, custom_outline="#2F384A", enabled=True
+    ):
+        bg = custom_bg if custom_bg is not None else (self.KEY_SPEC_BG if is_special else self.KEY_BG)
+        state = "normal" if enabled else "hidden"
         rect_id = self.canvas.create_rectangle(
             x1, y1, x2, y2,
-            fill=bg, outline="#2F384A", width=1
+            fill=bg, outline=custom_outline, width=1, state=state
         )
         txt_id = self.canvas.create_text(
             (x1 + x2) * 0.5, (y1 + y2) * 0.5,
             text=label, fill=self.KEY_TEXT,
-            font=("Segoe UI", font_size, "bold")
+            font=("Segoe UI", font_size, "bold"), state=state
         )
         key_obj = {
             "id": key_id,
@@ -525,6 +621,8 @@ class HandKeyboard:
             "cx": (x1 + x2) * 0.5, "cy": (y1 + y2) * 0.5,
             "is_special": is_special,
             "base_bg": bg,
+            "base_outline": custom_outline,
+            "enabled": enabled,
             "rect_id": rect_id,
             "txt_id": txt_id,
         }
@@ -563,9 +661,60 @@ class HandKeyboard:
         self.canvas.itemconfig(self.status_item, text=text)
         self.status_reset_at = (now + duration) if (now and duration > 0) else 0.0
 
+    def _set_suggestions(self, words, mode, active_idx=None):
+        self.suggestions = list(words[:self.SUGGESTION_COUNT])
+        self.suggestion_mode = mode if self.suggestions else None
+        self.active_suggestion_idx = active_idx if self.suggestions else None
+        self._refresh_suggestions_ui()
+
+    def _clear_suggestions(self):
+        self.suggestions = []
+        self.suggestion_mode = None
+        self.active_suggestion_idx = None
+        self._refresh_suggestions_ui()
+
+    def _refresh_suggestions_ui(self):
+        has_suggestions = bool(self.suggestions)
+        self.canvas.itemconfig(self.status_item, state="hidden" if has_suggestions else "normal")
+
+        for i in range(self.SUGGESTION_COUNT):
+            kid = f"SUGG_{i}"
+            slot = self.key_map.get(kid)
+            if not slot:
+                continue
+
+            if i < len(self.suggestions):
+                word = self.suggestions[i]
+                is_active = (self.suggestion_mode == "swipe" and i == self.active_suggestion_idx)
+                base_bg = self.SUGG_ACTIVE_BG if is_active else self.SUGG_BG
+                base_outline = self.SUGG_ACTIVE_OUTLINE if is_active else self.SUGG_OUTLINE
+                txt_color = "#67E8F9" if is_active else self.KEY_TEXT
+                font_size = 9 if len(word) > 12 else 10
+
+                slot["enabled"] = True
+                slot["base_bg"] = base_bg
+                slot["base_outline"] = base_outline
+
+                fill = self.KEY_HOVER_BG if self.hovered_key == kid else base_bg
+                outline = "#38BDF8" if self.hovered_key == kid else base_outline
+                self.canvas.itemconfig(slot["rect_id"], fill=fill, outline=outline, state="normal")
+                self.canvas.itemconfig(
+                    slot["txt_id"],
+                    text=word,
+                    fill=txt_color,
+                    font=("Segoe UI", font_size, "bold"),
+                    state="normal"
+                )
+            else:
+                slot["enabled"] = False
+                if self.hovered_key == kid:
+                    self.hovered_key = None
+                self.canvas.itemconfig(slot["rect_id"], state="hidden")
+                self.canvas.itemconfig(slot["txt_id"], text="", state="hidden")
+
     def _hit_test(self, lx, ly):
         for k in self.keys:
-            if k["x1"] <= lx <= k["x2"] and k["y1"] <= ly <= k["y2"]:
+            if k["enabled"] and k["x1"] <= lx <= k["x2"] and k["y1"] <= ly <= k["y2"]:
                 return k["id"]
         return None
 
@@ -574,7 +723,8 @@ class HandKeyboard:
             return
         if self.hovered_key and self.hovered_key in self.key_map:
             prev = self.key_map[self.hovered_key]
-            self.canvas.itemconfig(prev["rect_id"], fill=prev["base_bg"], outline="#2F384A")
+            if prev["enabled"]:
+                self.canvas.itemconfig(prev["rect_id"], fill=prev["base_bg"], outline=prev["base_outline"])
         self.hovered_key = key_id
         if key_id and key_id in self.key_map:
             curr = self.key_map[key_id]
@@ -599,16 +749,72 @@ class HandKeyboard:
                 joinstyle=tk.ROUND
             )
 
-    def _apply_casing(self, word):
-        if self.shift_mode == "caps":
+    @staticmethod
+    def _format_word(word, casing):
+        if casing == "caps":
             return word.upper()
-        if self.shift_mode == "once":
-            self.shift_mode = "off"
-            self._refresh_shift_visuals()
+        if casing == "title":
             return word.capitalize()
         return word
 
+    def _consume_shift_casing(self):
+        if self.shift_mode == "caps":
+            return "caps"
+        if self.shift_mode == "once":
+            self.shift_mode = "off"
+            self._refresh_shift_visuals()
+            return "title"
+        return "lower"
+
+    def _buffer_casing(self):
+        if self.shift_mode == "caps" or (len(self.typed_buffer) > 1 and self.typed_buffer.isupper()):
+            return "caps"
+        if self.typed_buffer and self.typed_buffer[0].isupper():
+            return "title"
+        return "lower"
+
+    def _update_prefix_suggestions(self):
+        if not self.typed_buffer:
+            self._clear_suggestions()
+            return
+        raw = self.decoder.suggest_prefix(self.typed_buffer, top_k=self.SUGGESTION_COUNT)
+        casing = self._buffer_casing()
+        formatted = [self._format_word(w, casing) for w in raw]
+        self._set_suggestions(formatted, mode="prefix", active_idx=None)
+
+    def _apply_suggestion(self, idx):
+        if idx >= len(self.suggestions):
+            return
+        chosen = self.suggestions[idx]
+
+        if self.suggestion_mode == "swipe":
+            if idx == self.active_suggestion_idx:
+                return
+            # Replace only the swiped word, preserving any leading auto-space
+            for _ in range(len(self.last_swiped_word)):
+                self.kb.tap(Key.backspace)
+            self.kb.type(chosen)
+            self.last_swiped_word = chosen
+            self.last_swiped_len = len(self.swipe_prefix_space) + len(chosen)
+            self.active_suggestion_idx = idx
+            self.auto_space_pending = True
+            self._refresh_suggestions_ui()
+
+        elif self.suggestion_mode == "prefix":
+            # Append only the remaining suffix + trailing space (no backspace needed)
+            suffix = chosen[len(self.typed_buffer):]
+            self.kb.type(suffix + " ")
+            self.typed_buffer = ""
+            self.last_swiped_len = 0
+            self.last_swiped_word = ""
+            self.swipe_prefix_space = ""
+            self.auto_space_pending = False
+            self._clear_suggestions()
+
     def _execute_tap(self, key_id, now):
+        if key_id.startswith("SUGG_"):
+            self._apply_suggestion(int(key_id.split("_")[1]))
+            return
         if key_id == "CLOSE":
             self.hide()
             return
@@ -639,26 +845,45 @@ class HandKeyboard:
                 for _ in range(self.last_swiped_len):
                     self.kb.tap(Key.backspace)
                 self.last_swiped_len = 0
+                self.last_swiped_word = ""
+                self.swipe_prefix_space = ""
                 self.auto_space_pending = False
+                self._clear_suggestions()
                 self._set_status("UNDID SWIPE", now, 0.9)
             else:
                 self.kb.tap(Key.backspace)
                 self.auto_space_pending = False
+                if self.typed_buffer:
+                    self.typed_buffer = self.typed_buffer[:-1]
+                    self._update_prefix_suggestions()
+                else:
+                    self._clear_suggestions()
             return
 
         if key_id == "SPACE":
             self.kb.tap(Key.space)
+            self.typed_buffer = ""
             self.last_swiped_len = 0
+            self.last_swiped_word = ""
+            self.swipe_prefix_space = ""
             self.auto_space_pending = False
+            self._clear_suggestions()
             return
 
         if key_id == "ENTER":
             self.kb.tap(Key.enter)
+            self.typed_buffer = ""
             self.last_swiped_len = 0
+            self.last_swiped_word = ""
+            self.swipe_prefix_space = ""
             self.auto_space_pending = False
+            self._clear_suggestions()
             return
 
+        # Standard letter or punctuation character
         self.last_swiped_len = 0
+        self.last_swiped_word = ""
+        self.swipe_prefix_space = ""
         if len(key_id) == 1 and key_id.isalpha():
             ch = key_id.upper() if self.shift_mode != "off" else key_id
             if self.shift_mode == "once":
@@ -666,12 +891,15 @@ class HandKeyboard:
                 self._refresh_shift_visuals()
             self.kb.type(ch)
             self.auto_space_pending = False
+            self.typed_buffer += ch
+            self._update_prefix_suggestions()
         else:
             self.kb.type(key_id)
             self.auto_space_pending = False
+            self.typed_buffer = ""
+            self._clear_suggestions()
 
     def _finish_swipe(self, now):
-        # Trim the final ~60ms of points so opening a fist/releasing thumb doesn't hook the tail
         pts = self.swipe_points
         if len(pts) > 3:
             end_t = pts[-1][0]
@@ -684,28 +912,34 @@ class HandKeyboard:
             for (_, lx, ly) in pts
         ]
 
-        # If total swipe travel was tiny, treat it as a normal tap on the starting key
         if _path_length(unit_pts) < self.MIN_SWIPE_UNITS:
             if self.press_key:
                 self._execute_tap(self.press_key, now)
             return
 
-        matches = self.decoder.decode(unit_pts, top_k=3)
+        matches = self.decoder.decode(unit_pts, top_k=self.SUGGESTION_COUNT)
         if not matches:
+            self._clear_suggestions()
             self._set_status("NO MATCH", now, 0.8)
             return
 
-        word = self._apply_casing(matches[0])
-        prefix = " " if self.auto_space_pending else ""
+        casing = self._consume_shift_casing()
+        formatted = [self._format_word(w, casing) for w in matches]
+        word = formatted[0]
+
+        prefix = " " if (self.auto_space_pending or self.typed_buffer) else ""
         out_text = prefix + word
         self.kb.type(out_text)
 
+        self.typed_buffer = ""
+        self.swipe_prefix_space = prefix
+        self.last_swiped_word = word
         self.last_swiped_len = len(out_text)
         self.auto_space_pending = True
-        self._set_status(f"SWIPED: {word}", now, 1.4)
+        self._set_suggestions(formatted, mode="swipe", active_idx=0)
 
     def update(self, cursor_x, cursor_y, is_pressed, now):
-        """Processes cursor position and virtual press state (thumb or closed fist) for one frame."""
+        """Processes cursor position and virtual press state (thumb, fist, or index drop) for one frame."""
         if not self.is_visible:
             return
 
@@ -742,7 +976,14 @@ class HandKeyboard:
                 if now >= self.bksp_next_repeat:
                     self.kb.tap(Key.backspace)
                     self.last_swiped_len = 0
+                    self.last_swiped_word = ""
+                    self.swipe_prefix_space = ""
                     self.auto_space_pending = False
+                    if self.typed_buffer:
+                        self.typed_buffer = self.typed_buffer[:-1]
+                        self._update_prefix_suggestions()
+                    else:
+                        self._clear_suggestions()
                     self.bksp_did_repeat = True
                     self.bksp_next_repeat = now + self.BKSP_REPEAT_INTERVAL
 
@@ -774,7 +1015,7 @@ class HandKeyboard:
                 if self.swipe_release_time is None:
                     self.swipe_release_time = now
                 if (now - self.swipe_release_time) < self.SWIPE_RELEASE_GRACE_SEC:
-                    return  # Wait briefly in case fast fist/thumb motion flickered for 1-2 frames
+                    return
 
                 self.was_pressed = False
                 self.swipe_release_time = None
@@ -792,5 +1033,5 @@ class HandKeyboard:
             self.is_swiping = False
             self.swipe_points.clear()
 
-            if self.hovered_key and self.hovered_key in self.key_map:
+            if self.hovered_key and self.hovered_key in self.key_map and self.key_map[self.hovered_key]["enabled"]:
                 self.canvas.itemconfig(self.key_map[self.hovered_key]["rect_id"], fill=self.KEY_HOVER_BG)
