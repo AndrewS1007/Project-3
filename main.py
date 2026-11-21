@@ -5,6 +5,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from cursor_indicator import CursorIndicator
+from keyboard import HandKeyboard
 from mouse import HandMouse
 
 
@@ -41,9 +42,10 @@ def sort_detected_hands(results, frame_w, frame_h, mirror_handedness=True):
 
 
 def main():
-    # 1. Initialize Overlay & Mouse Controller
+    # 1. Initialize Overlay, Mouse Controller & Focus-Safe Keyboard (shared Tk root)
     indicator = CursorIndicator(hud_corner="bottom-right")
     hand_mouse = HandMouse(default_hand="Right")
+    hand_keyboard = HandKeyboard(indicator.root)
 
     # 2. Setup Modern MediaPipe Hand Landmarker
     base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
@@ -82,8 +84,24 @@ def main():
             results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
             detected_hands = sort_detected_hands(results, w, h, MIRROR_HANDEDNESS)
 
-            # Run Mouse Logic & Update Floating Overlay + Corner HUD
-            cursor_state = hand_mouse.update(frame, detected_hands, now)
+            # Run Mouse Logic (passing keyboard bounds so clicks inside it stay focus-safe)
+            kb_rect = hand_keyboard.get_bounds() if hand_keyboard.is_visible else None
+            cursor_state = hand_mouse.update(frame, detected_hands, now, keyboard_rect=kb_rect)
+
+            # Read cursor coordinates in Tkinter screen space
+            px, py = indicator.root.winfo_pointerxy()
+
+            # Keyboard activation: Shaka manual toggle or I-beam textbox tap
+            if hand_mouse.keyboard_toggle_requested:
+                hand_keyboard.toggle(cursor_y=py)
+            elif hand_mouse.textbox_clicked and not hand_keyboard.is_visible:
+                hand_keyboard.show(cursor_y=py)
+
+            # Update Keyboard Tap / Hold-and-Swipe Engine
+            if hand_keyboard.is_visible:
+                hand_keyboard.update(px, py, hand_mouse.is_virtual_clicking, now)
+
+            # Update Floating Cursor Badge, Corner HUD & Shared Tk Event Loop
             indicator.update(
                 cursor_state,
                 active_hand=hand_mouse.active_hand,
@@ -95,6 +113,7 @@ def main():
                 break
     finally:
         hand_mouse.cleanup()
+        hand_keyboard.hide()
         indicator.close()
         landmarker.close()
         cap.release()
