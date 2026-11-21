@@ -61,6 +61,11 @@ curr_x, curr_y = 0, 0
 click_lock_x, click_lock_y = 0, 0
 DRAG_DEADZONE = 40  
 
+# HIGHER SENSITIVITY: Thumb-Across-Palm Thresholds (0.0 = index base, 1.0 = pinky base)
+# Triggers as soon as the thumb tucks slightly past the index base knuckle
+THUMB_CLICK_START = 0.12
+THUMB_CLICK_DROP = -0.08
+
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -91,21 +96,25 @@ while True:
             target_x = int(middle_tip.x * SCREEN_WIDTH)
             target_y = int(middle_tip.y * SCREEN_HEIGHT)
 
-            # Finger Coordinates
+            # Key Coordinates
             tx, ty = pts[4]           # Thumb tip
-            ix, iy = pts[8]           # Index tip
+            ix_mcp, iy_mcp = pts[5]   # Index base knuckle
+            px_mcp, py_mcp = pts[17]  # Pinky base knuckle
             wrist_x, wrist_y = pts[0] # Wrist
 
-            # Distance for Left Click Pinch
-            dist_index = math.hypot(tx - ix, ty - iy)
-
-            # Pinch Thresholds (Left Click)
-            PINCH_START = 35  
-            PINCH_DROP = 55   
+            # -------------------------
+            # THUMB ACROSS PALM RATIO (Scale-Invariant)
+            # -------------------------
+            palm_dx = px_mcp - ix_mcp
+            palm_dy = py_mcp - iy_mcp
+            palm_len_sq = max(palm_dx * palm_dx + palm_dy * palm_dy, 1)
+            thumb_palm_ratio = ((tx - ix_mcp) * palm_dx + (ty - iy_mcp) * palm_dy) / palm_len_sq
 
             # -------------------------
             # GESTURE BOOLEANS
             # -------------------------
+            middle_up = pts[12][1] < pts[10][1]
+
             # Fist: All four fingertips below their respective middle knuckles
             is_fist = (
                 pts[8][1] > pts[6][1] and 
@@ -116,11 +125,11 @@ while True:
             
             # Pinky Drop (Right Click): Pinky tip below midpoint, middle finger UP
             pinky_midpoint_y = (pts[19][1] + pts[18][1]) / 2.0
-            is_pinky_drop = (pts[20][1] > pinky_midpoint_y) and (pts[12][1] < pts[10][1])
+            is_pinky_drop = (pts[20][1] > pinky_midpoint_y) and middle_up
 
-            # Index Drop (Double Click): Index tip below midpoint, middle finger UP, thumb away
+            # Index Drop (Double Click): Index tip below midpoint, middle finger UP
             index_midpoint_y = (pts[7][1] + pts[6][1]) / 2.0
-            is_index_drop = (pts[8][1] > index_midpoint_y) and (pts[12][1] < pts[10][1]) and (dist_index > 60)
+            is_index_drop = (pts[8][1] > index_midpoint_y) and middle_up
 
             # -------------------------
             # FIST DETECTOR (2D Scroll Joystick)
@@ -156,16 +165,17 @@ while True:
                 is_fist_scroll = False
 
             # -------------------------
-            # LEFT CLICK & DRAG (Index Tip + Thumb Tip)
+            # LEFT CLICK & DRAG (Thumb Across Palm)
             # -------------------------
-            if dist_index < PINCH_START and not is_fist_scroll and not is_double_clicking and not is_right_clicking:
-                if not is_clicking:
+            if thumb_palm_ratio > THUMB_CLICK_START and not is_fist_scroll and not is_double_clicking and not is_right_clicking:
+                if not is_clicking and middle_up:
                     mouse.press(Button.left)
                     is_clicking = True
                     is_dragging = False 
                     click_lock_x, click_lock_y = target_x, target_y
-                cv2.circle(frame, (ix, iy), 15, (0, 255, 0), cv2.FILLED)
-            elif dist_index > PINCH_DROP:
+                if is_clicking:
+                    cv2.circle(frame, (tx, ty), 15, (0, 255, 0), cv2.FILLED)
+            elif thumb_palm_ratio < THUMB_CLICK_DROP:
                 if is_clicking:
                     mouse.release(Button.left)
                     is_clicking = False
