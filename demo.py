@@ -42,6 +42,11 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+# Active Tracking Box Margins (maps inner camera region to 100% of screen)
+MARGIN_X = 0.18
+MARGIN_TOP = 0.25
+MARGIN_BOTTOM = 0.18
+
 # State variables
 is_clicking = False
 is_double_clicking = False
@@ -87,6 +92,13 @@ while True:
     results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
     h, w, c = frame.shape
 
+    # Draw Active Tracking Box on debug view
+    box_x1 = int(MARGIN_X * w)
+    box_y1 = int(MARGIN_TOP * h)
+    box_x2 = int((1.0 - MARGIN_X) * w)
+    box_y2 = int((1.0 - MARGIN_BOTTOM) * h)
+    cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (120, 120, 120), 1)
+
     if results.hand_landmarks:
         for hand_landmarks in results.hand_landmarks:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
@@ -96,12 +108,21 @@ while True:
             for px, py in pts:
                 cv2.circle(frame, (px, py), 4, (0, 255, 150), cv2.FILLED)
 
+            # Highlight Landmark 9 (Middle MCP) as the active cursor anchor
+            cv2.circle(frame, pts[9], 8, (255, 255, 255), 2)
+
             # -------------------------
-            # GET RAW TARGET (MIDDLE FINGER)
+            # GET RAW TARGET (MIDDLE MCP - LANDMARK 9)
             # -------------------------
-            middle_tip = hand_landmarks[12]
-            target_x = int(middle_tip.x * SCREEN_WIDTH)
-            target_y = int(middle_tip.y * SCREEN_HEIGHT)
+            middle_mcp = hand_landmarks[9]
+            norm_x = (middle_mcp.x - MARGIN_X) / (1.0 - 2.0 * MARGIN_X)
+            norm_y = (middle_mcp.y - MARGIN_TOP) / (1.0 - MARGIN_TOP - MARGIN_BOTTOM)
+
+            norm_x = max(0.0, min(1.0, norm_x))
+            norm_y = max(0.0, min(1.0, norm_y))
+
+            target_x = int(norm_x * (SCREEN_WIDTH - 1))
+            target_y = int(norm_y * (SCREEN_HEIGHT - 1))
 
             # Key Coordinates
             tx, ty = pts[4]           # Thumb tip
